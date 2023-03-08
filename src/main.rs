@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use actix::io::SinkWrite;
 use actix::prelude::*;
 use actix_codec::Framed;
@@ -6,6 +7,7 @@ use awc::{error::WsProtocolError, BoxedSocket};
 use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures_util::stream::StreamExt;
+use structopt::StructOpt;
 use tun::AsyncDevice;
 use tun::TunPacket;
 use tun::TunPacketCodec;
@@ -117,6 +119,54 @@ impl StreamHandler<Result<TunPacket, std::io::Error>> for VpnWebSocket {
     }
 }
 
+#[derive(Debug, StructOpt, Clone)]
+pub struct CliOptions {
+    #[structopt(long = "http", help = "Enable http server")]
+    pub http: bool,
+
+    #[structopt(
+    long = "http-threads",
+    help = "Number of threads to use for the server",
+    default_value = "2"
+    )]
+    pub http_threads: u64,
+
+    #[structopt(
+    long = "http-port",
+    help = "Port number of the server",
+    default_value = "8080"
+    )]
+    pub http_port: u16,
+
+    #[structopt(
+    long = "websocket-address",
+    help = "Bind websocket address",
+    default_value = "ws://host.docker.internal:7465/net-api/v2/vpn/net/37b06a7a460346ebbc0ecd2ac14d812a/raw/192.168.8.7/50671"
+    )]
+    pub websocket_address: String,
+
+    #[structopt(
+    long = "vpn-network-addr",
+    help = "Bind address to the vpn network",
+    default_value = "10.0.0.1"
+    )]
+    pub vpn_network_addr: String,
+
+    #[structopt(
+    long = "vpn-network-mast",
+    help = "Vpn network mask",
+    default_value = "255.255.255.0"
+    )]
+    pub vpn_network_mask: String,
+
+    #[structopt(
+    long = "vpn-interface-name",
+    help = "Name of the vpn interface",
+    default_value = "vpn0"
+    )]
+    pub vpn_interface_name: String,
+}
+
 #[actix_rt::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::env::set_var(
@@ -124,20 +174,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("RUST_LOG").unwrap_or("info".to_string()),
     );
     env_logger::init();
+    let opt: CliOptions = CliOptions::from_args();
+    let app_key = std::env::var("YAGNA_APPKEY").expect("YAGNA_APPKEY not set");
     let (_tx, _rx) = std::sync::mpsc::channel::<bytes::Bytes>();
     //let connector = awc::Connector::new().ssl(ssl).finish();
     let (_req, ws_socket) = awc::Client::default()
-        .ws("ws://host.docker.internal:7465/net-api/v2/vpn/net/37b06a7a460346ebbc0ecd2ac14d812a/raw/192.168.8.7/50671")
-        .header("Authorization", "Bearer 04233840468323139872")
+        .ws(opt.websocket_address)
+        .header("Authorization", format!("Bearer {app_key}"))
         .connect()
         .await?;
 
     let (ws_sink, ws_stream) = ws_socket.split();
 
+    let addr = opt.vpn_network_addr.parse::<IpAddr>()?;
+    let mask = opt.vpn_network_mask.parse::<IpAddr>()?;
     let mut config = tun::Configuration::default();
     config
-        .address((10, 0, 0, 1))
-        .netmask((255, 255, 255, 0))
+        .address(addr)
+        .netmask(mask)
+        .name(opt.vpn_interface_name)
         .up();
 
     let dev = tun::create_as_async(&config).unwrap();
@@ -145,6 +200,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tun_sink, tun_stream) = dev.into_framed().split();
     let _ws_actor = VpnWebSocket::start(ws_sink, ws_stream, tun_sink, tun_stream);
 
-    let _ = actix_rt::signal::ctrl_c().await?;
+    actix_rt::signal::ctrl_c().await?;
     Ok(())
 }

@@ -1,67 +1,40 @@
 use actix::io::SinkWrite;
 use actix::prelude::*;
 use actix_codec::Framed;
-use awc::ws::Frame;
+use awc::ws;
 use awc::{error::WsProtocolError, BoxedSocket};
-
+use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures_util::stream::StreamExt;
-use log::{error, info};
+use tun::AsyncDevice;
+use tun::TunPacket;
+use tun::TunPacketCodec;
 
-use actix::Message;
-use actix_web_actors::ws;
-use actix_web_actors::ws::ProtocolError;
-use bytes::Bytes;
-
-/*
-#[derive(Message)]
-#[rtype(result = "WsResult<()>")]
-pub struct Packet {
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Message)]
-#[rtype(result = "WsResult<()>")]
-pub struct Shutdown;
-*/
-
-type WsFramedSink = SplitSink<Framed<BoxedSocket, awc::ws::Codec>, awc::ws::Message>;
-type WsFramedStream = SplitStream<Framed<BoxedSocket, awc::ws::Codec>>;
+type WsFramedSink = SplitSink<Framed<BoxedSocket, ws::Codec>, ws::Message>;
+type WsFramedStream = SplitStream<Framed<BoxedSocket, ws::Codec>>;
+type TunFramedSink = SplitSink<tokio_util::codec::Framed<AsyncDevice, TunPacketCodec>, TunPacket>;
+type TunFramedStream = SplitStream<tokio_util::codec::Framed<AsyncDevice, TunPacketCodec>>;
 
 pub struct VpnWebSocket {
-    //network_id: String,
-    //heartbeat: Instant,
-    //vpn: Recipient<Packet>,
     ws_sink: SinkWrite<ws::Message, WsFramedSink>,
+    tun_sink: SinkWrite<TunPacket, TunFramedSink>,
 }
 
 impl VpnWebSocket {
-    pub fn start(ws_sink: WsFramedSink, ws_stream: WsFramedStream) -> Addr<Self> {
+    pub fn start(
+        ws_sink: WsFramedSink,
+        ws_stream: WsFramedStream,
+        tun_sink: TunFramedSink,
+        tun_stream: TunFramedStream,
+    ) -> Addr<Self> {
         VpnWebSocket::create(|ctx| {
             ctx.add_stream(ws_stream);
+            ctx.add_stream(tun_stream);
             VpnWebSocket {
                 ws_sink: SinkWrite::new(ws_sink, ctx),
+                tun_sink: SinkWrite::new(tun_sink, ctx),
             }
         })
-    }
-
-    fn forward(&self, _data: Vec<u8>, _ctx: &mut <Self as Actor>::Context) {
-        println!("Forwarding data to VPN");
-        /*
-                let vpn = self.vpn.clone();
-                vpn.send(Packet {
-                    data,
-                    meta: self.meta,
-                })
-                    .into_actor(self)
-                    .map(move |result, this, ctx| {
-                        if result.is_err() {
-                            log::error!("VPN WebSocket: VPN {} no longer exists", this.network_id);
-                            let _ = ctx.address().do_send(Shutdown {});
-                        }
-                    })
-                    .wait(ctx);
-        */
     }
 }
 
@@ -77,56 +50,39 @@ impl Actor for VpnWebSocket {
     }
 }
 
-impl actix::io::WriteHandler<WsProtocolError> for VpnWebSocket {}
+impl io::WriteHandler<WsProtocolError> for VpnWebSocket {}
+impl io::WriteHandler<std::io::Error> for VpnWebSocket {}
 
-#[derive(Message, Debug)]
-#[rtype(result = "()")]
-struct Pong {
-    msg: Bytes,
-}
-
-impl Handler<Pong> for VpnWebSocket {
-    type Result = ();
-
-    fn handle(&mut self, msg: Pong, _ctx: &mut Self::Context) {
-        info!("Pushing Message {:?}", msg);
-        if let Err(error) = self.ws_sink.write(ws::Message::Pong(msg.msg)) {
-            error!("Error RosClient {:?}", error);
-        }
-    }
-}
-
-/*impl StreamHandler<Vec<u8>> for VpnWebSocket {
-    fn handle(&mut self, data: Vec<u8>, ctx: &mut Self::Context) {
-        ctx.binary(data)
-    }
-}*/
-
-impl StreamHandler<Result<Frame, ProtocolError>> for VpnWebSocket {
-    fn handle(&mut self, msg: Result<Frame, ProtocolError>, ctx: &mut Self::Context) {
-        //self.heartbeat = Instant::now();
+impl StreamHandler<Result<ws::Frame, WsProtocolError>> for VpnWebSocket {
+    fn handle(&mut self, msg: Result<ws::Frame, WsProtocolError>, ctx: &mut Self::Context) {
         match msg {
-            Ok(Frame::Text(_text)) => {
+            Ok(ws::Frame::Text(_text)) => {
                 log::error!("VPN WebSocket: Received text frame");
                 ctx.stop();
             }
-            Ok(Frame::Binary(bytes)) => self.forward(bytes.to_vec(), ctx),
-            Ok(Frame::Ping(msg)) => {
+            Ok(ws::Frame::Binary(bytes)) => {
+                log::info!("Received Binary packet, sending to TUN...");
+                if let Err(err) = self.tun_sink.write(TunPacket::new(bytes.to_vec())) {
+                    log::error!("Error sending packet to TUN: {:?}", err);
+                    ctx.stop();
+                }
+            }
+            Ok(ws::Frame::Ping(msg)) => {
                 log::info!("Received Ping Message, replying with pong...");
                 if let Err(err) = self.ws_sink.write(ws::Message::Pong(msg)) {
                     log::error!("Error replying with pong: {:?}", err);
                     ctx.stop();
                 }
             }
-            Ok(Frame::Pong(_)) => {
+            Ok(ws::Frame::Pong(_)) => {
                 log::info!("Received Pong Message");
             }
-            Ok(Frame::Close(reason)) => {
+            Ok(ws::Frame::Close(reason)) => {
                 //ctx.close(reason);
                 log::info!("Received Close Message: {:?}", reason);
                 ctx.stop();
             }
-            Ok(Frame::Continuation(_)) => {
+            Ok(ws::Frame::Continuation(_)) => {
                 //ignore
             }
             Err(err) => {
@@ -137,78 +93,28 @@ impl StreamHandler<Result<Frame, ProtocolError>> for VpnWebSocket {
     }
 }
 
-/*
-impl Handler<Shutdown> for VpnWebSocket {
-    type Result = <Shutdown as Message>::Result;
-
-    fn handle(&mut self, _: Shutdown, ctx: &mut Self::Context) -> Self::Result {
-        log::warn!("VPN WebSocket: VPN is shutting down");
-        ctx.stop();
-        Ok(())
-    }
-}*/
-
-#[cfg(all(unix))]
-async fn read_tun_interface(receive_bytes: std::sync::mpsc::Receiver<bytes::Bytes>) {
-    use packet::ip::Packet;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use tokio::io::AsyncReadExt;
-    use tokio::io::AsyncWriteExt;
-    use tun::TunPacket;
-    let mut config = tun::Configuration::default();
-    config
-        .address((10, 0, 0, 1))
-        .netmask((255, 255, 255, 0))
-        .up();
-
-    //    let dev = Arc::new(Mutex::new(tun::create_as_async(&config).unwrap()));
-
-    let dev = tun::create_as_async(&config).unwrap();
-
-    //let (mut stream_stream) = reader.into_framed();
-    let (mut stream_sink, mut stream_stream) =
-        futures_util::stream::StreamExt::split(dev.into_framed());
-    if false {
-        actix::spawn(async move {
-            println!("Waiting for stream...");
-        });
-    }
-
-    println!("Waiting for packet...");
-
-    while let Some(packet) = stream_stream.next().await {
-        match packet {
-            Ok(pkt) => {
-                let b = bytes::Bytes::from(pkt.get_bytes().to_vec()).clone();
-                println!("Sending packet: {:#?}", Packet::unchecked(b.clone()));
-                // sink.send(awc::ws::Message::Binary(b))
-                //   .await
-                // .unwrap();
+impl StreamHandler<Result<TunPacket, std::io::Error>> for VpnWebSocket {
+    fn handle(&mut self, msg: Result<TunPacket, std::io::Error>, ctx: &mut Self::Context) {
+        //self.heartbeat = Instant::now();
+        match msg {
+            Ok(packet) => {
+                log::info!(
+                    "Received packet from TUN {:#?}",
+                    packet::ip::Packet::unchecked(packet.get_bytes())
+                );
+                if let Err(err) = self.ws_sink.write(ws::Message::Binary(Bytes::from(
+                    packet.get_bytes().to_vec(),
+                ))) {
+                    log::error!("Error sending packet to websocket: {:?}", err);
+                    ctx.stop();
+                }
             }
-            Err(err) => panic!("Error: {:?}", err),
+            Err(err) => {
+                log::error!("Tun io error: {:?}", err);
+                ctx.stop();
+            }
         }
     }
-
-    /*  let (mut read,mut  write) = tokio::io::split(dev);
-    //    let dev_clone = dev.clone();
-
-
-        loop {
-            let mut buf = vec![0u8; 10];
-            println!("Waiting for packet...");
-            let bytes_read = read.read(&mut buf).await.unwrap();
-            println!("Received packet: {:#?}", Packet::unchecked(bytes::Bytes::from(buf.clone())));
-            if bytes_read > 0 {
-
-
-    //            println!("Send packet: {:#?}", Packet::unchecked(bytes::Bytes::from(buf.clone())));
-
-            //    sink.send(awc::ws::Message::Binary(bytes::Bytes::from(buf.clone())))
-              //      .await
-                //    .unwrap();
-            }
-        }*/
 }
 
 #[actix_rt::main]
@@ -227,11 +133,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     let (ws_sink, ws_stream) = ws_socket.split();
-    let _addr = VpnWebSocket::start(ws_sink, ws_stream);
-    //let addr = addr.start();
 
-    //#[cfg(all(unix))]
-    //read_tun_interface(sink, stream, rx).await;
+    let mut config = tun::Configuration::default();
+    config
+        .address((10, 0, 0, 1))
+        .netmask((255, 255, 255, 0))
+        .up();
+
+    let dev = tun::create_as_async(&config).unwrap();
+
+    let (tun_sink, tun_stream) = dev.into_framed().split();
+    let _ws_actor = VpnWebSocket::start(ws_sink, ws_stream, tun_sink, tun_stream);
+
     let _ = actix_rt::signal::ctrl_c().await?;
     Ok(())
 }

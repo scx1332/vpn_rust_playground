@@ -96,6 +96,30 @@ impl StreamHandler<Result<ws::Frame, WsProtocolError>> for VpnWebSocket {
     }
 }
 
+impl StreamHandler<Result<TunPacket, std::io::Error>> for VpnWebSocket {
+    fn handle(&mut self, msg: Result<TunPacket, std::io::Error>, ctx: &mut Self::Context) {
+        //self.heartbeat = Instant::now();
+        match msg {
+            Ok(packet) => {
+                log::info!(
+                    "Received packet from TUN {:#?}",
+                    packet::ip::Packet::unchecked(packet.get_bytes())
+                );
+                if let Err(err) = self.ws_sink.write(ws::Message::Binary(Bytes::from(
+                    packet.get_bytes().to_vec(),
+                ))) {
+                    log::error!("Error sending packet to websocket: {:?}", err);
+                    ctx.stop();
+                }
+            }
+            Err(err) => {
+                log::error!("Tun io error: {:?}", err);
+                ctx.stop();
+            }
+        }
+    }
+}
+
 impl StreamHandler<Result<TapPacket, std::io::Error>> for VpnWebSocket {
     fn handle(&mut self, msg: Result<TapPacket, std::io::Error>, ctx: &mut Self::Context) {
         //self.heartbeat = Instant::now();

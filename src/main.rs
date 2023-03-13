@@ -10,32 +10,49 @@ use bytes::Bytes;
 use futures::stream::{SplitSink, SplitStream};
 use futures_util::stream::StreamExt;
 use structopt::StructOpt;
-use tun::AsyncDevice;
+use tun::{AsyncDevice, TunPacket, TunPacketCodec};
 use crate::tap_codec::{TapPacket, TapPacketCodec};
 
 type WsFramedSink = SplitSink<Framed<BoxedSocket, ws::Codec>, ws::Message>;
 type WsFramedStream = SplitStream<Framed<BoxedSocket, ws::Codec>>;
-type TunFramedSink = SplitSink<tokio_util::codec::Framed<AsyncDevice, TapPacketCodec>, TapPacket>;
-type TunFramedStream = SplitStream<tokio_util::codec::Framed<AsyncDevice, TapPacketCodec>>;
+type TunFramedSink = SplitSink<tokio_util::codec::Framed<AsyncDevice, TunPacketCodec>, TunPacket>;
+type TunFramedStream = SplitStream<tokio_util::codec::Framed<AsyncDevice, TunPacketCodec>>;
+type TapFramedSink = SplitSink<tokio_util::codec::Framed<AsyncDevice, TapPacketCodec>, TapPacket>;
+type TapFramedStream = SplitStream<tokio_util::codec::Framed<AsyncDevice, TapPacketCodec>>;
 
 pub struct VpnWebSocket {
     ws_sink: SinkWrite<ws::Message, WsFramedSink>,
-    tun_sink: SinkWrite<TapPacket, TunFramedSink>,
+    tap_sink: Option<SinkWrite<TapPacket, TapFramedSink>>,
+    tun_sink: Option<SinkWrite<TunPacket, TunFramedSink>>,
 }
+
+
 
 impl VpnWebSocket {
     pub fn start(
         ws_sink: WsFramedSink,
         ws_stream: WsFramedStream,
-        tun_sink: TunFramedSink,
-        tun_stream: TunFramedStream,
+        tun_sink: Option<TunFramedSink>,
+        tun_stream: Option<TunFramedStream>,
+        tap_sink: Option<TapFramedSink>,
+        tap_stream: Option<TapFramedStream>,
     ) -> Addr<Self> {
         VpnWebSocket::create(|ctx| {
             ctx.add_stream(ws_stream);
-            ctx.add_stream(tun_stream);
-            VpnWebSocket {
-                ws_sink: SinkWrite::new(ws_sink, ctx),
-                tun_sink: SinkWrite::new(tun_sink, ctx),
+            if let (Some(tap_sink), Some(tap_stream)) = (tap_sink, tap_stream) {
+                ctx.add_stream(tap_stream);
+                return VpnWebSocket {
+                    ws_sink: SinkWrite::new(ws_sink, ctx),
+                    tun_sink: None,
+                    tap_sink: Some(SinkWrite::new(tap_sink, ctx)),
+                }
+            } else {
+                ctx.add_stream(tun_stream.unwrap());
+                return VpnWebSocket {
+                    ws_sink: SinkWrite::new(ws_sink, ctx),
+                    tun_sink: Some(SinkWrite::new(tun_sink.unwrap(), ctx)),
+                    tap_sink: None,
+                }
             }
         })
     }
@@ -64,10 +81,18 @@ impl StreamHandler<Result<ws::Frame, WsProtocolError>> for VpnWebSocket {
                 ctx.stop();
             }
             Ok(ws::Frame::Binary(bytes)) => {
-                log::info!("Received Binary packet, sending to TUN...");
-                if let Err(err) = self.tun_sink.write(TapPacket::new(bytes.to_vec())) {
-                    log::error!("Error sending packet to TUN: {:?}", err);
-                    ctx.stop();
+                if let Some(tun_sink) = self.tun_sink.as_mut() {
+                    log::info!("Received Binary packet, sending to TUN...");
+                    if let Err(err) = tun_sink.write(TunPacket::new(bytes.to_vec())) {
+                        log::error!("Error sending packet to TUN: {:?}", err);
+                        ctx.stop();
+                    }
+                } else {
+                    log::info!("Received Binary packet, sending to TAP...");
+                    if let Err(err) = self.tap_sink.as_mut().expect("tap sink has to be here").write(TapPacket::new(bytes.to_vec())) {
+                        log::error!("Error sending packet to TUN: {:?}", err);
+                        ctx.stop();
+                    }
                 }
             }
             Ok(ws::Frame::Ping(msg)) => {
@@ -236,9 +261,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dev = tun::create_as_async(&config).unwrap();
 
+    let _ws_actor = if opt.vpn_layer == "tap" {
+        let (tap_sink, tap_stream) = tokio_util::codec::Framed::new(dev, TapPacketCodec::new()).split();
+        VpnWebSocket::start(ws_sink, ws_stream, None, None, Some(tap_sink), Some(tap_stream))
+    } else {
+        let (tun_sink, tun_stream) = dev.into_framed().split();
+        VpnWebSocket::start(ws_sink, ws_stream, Some(tun_sink), Some(tun_stream), None, None)
+    };
 
-    let (tun_sink, tun_stream) = tokio_util::codec::Framed::new(dev, TapPacketCodec::new()).split();
-    let _ws_actor = VpnWebSocket::start(ws_sink, ws_stream, tun_sink, tun_stream);
 
     actix_rt::signal::ctrl_c().await?;
     Ok(())

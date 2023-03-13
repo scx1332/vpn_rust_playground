@@ -1,3 +1,5 @@
+mod tap_codec;
+
 use std::net::IpAddr;
 use actix::io::SinkWrite;
 use actix::prelude::*;
@@ -9,17 +11,16 @@ use futures::stream::{SplitSink, SplitStream};
 use futures_util::stream::StreamExt;
 use structopt::StructOpt;
 use tun::AsyncDevice;
-use tun::TunPacket;
-use tun::TunPacketCodec;
+use crate::tap_codec::{TapPacket, TapPacketCodec};
 
 type WsFramedSink = SplitSink<Framed<BoxedSocket, ws::Codec>, ws::Message>;
 type WsFramedStream = SplitStream<Framed<BoxedSocket, ws::Codec>>;
-type TunFramedSink = SplitSink<tokio_util::codec::Framed<AsyncDevice, TunPacketCodec>, TunPacket>;
-type TunFramedStream = SplitStream<tokio_util::codec::Framed<AsyncDevice, TunPacketCodec>>;
+type TunFramedSink = SplitSink<tokio_util::codec::Framed<AsyncDevice, TapPacketCodec>, TapPacket>;
+type TunFramedStream = SplitStream<tokio_util::codec::Framed<AsyncDevice, TapPacketCodec>>;
 
 pub struct VpnWebSocket {
     ws_sink: SinkWrite<ws::Message, WsFramedSink>,
-    tun_sink: SinkWrite<TunPacket, TunFramedSink>,
+    tun_sink: SinkWrite<TapPacket, TunFramedSink>,
 }
 
 impl VpnWebSocket {
@@ -64,7 +65,7 @@ impl StreamHandler<Result<ws::Frame, WsProtocolError>> for VpnWebSocket {
             }
             Ok(ws::Frame::Binary(bytes)) => {
                 log::info!("Received Binary packet, sending to TUN...");
-                if let Err(err) = self.tun_sink.write(TunPacket::new(bytes.to_vec())) {
+                if let Err(err) = self.tun_sink.write(TapPacket::new(bytes.to_vec())) {
                     log::error!("Error sending packet to TUN: {:?}", err);
                     ctx.stop();
                 }
@@ -95,14 +96,14 @@ impl StreamHandler<Result<ws::Frame, WsProtocolError>> for VpnWebSocket {
     }
 }
 
-impl StreamHandler<Result<TunPacket, std::io::Error>> for VpnWebSocket {
-    fn handle(&mut self, msg: Result<TunPacket, std::io::Error>, ctx: &mut Self::Context) {
+impl StreamHandler<Result<TapPacket, std::io::Error>> for VpnWebSocket {
+    fn handle(&mut self, msg: Result<TapPacket, std::io::Error>, ctx: &mut Self::Context) {
         //self.heartbeat = Instant::now();
         match msg {
             Ok(packet) => {
                 log::info!(
                     "Received packet from TUN {:#?}",
-                    packet::ip::Packet::unchecked(packet.get_bytes())
+                    packet.get_bytes()
                 );
                 if let Err(err) = self.ws_sink.write(ws::Message::Binary(Bytes::from(
                     packet.get_bytes().to_vec(),
@@ -141,14 +142,14 @@ pub struct CliOptions {
     #[structopt(
     long = "websocket-address",
     help = "Bind websocket address",
-    default_value = "ws://host.docker.internal:7465/net-api/v2/vpn/net/37b06a7a460346ebbc0ecd2ac14d812a/raw/192.168.8.7/50671"
+    default_value = "ws://host.docker.internal:7465/net-api/v2/vpn/net/dd45782a49374df98c9f6b94fd26702f/raw/from/192.168.8.1/to/192.168.8.7"
     )]
     pub websocket_address: String,
 
     #[structopt(
     long = "vpn-network-addr",
     help = "Bind address to the vpn network",
-    default_value = "10.0.0.1"
+    default_value = "192.168.8.1"
     )]
     pub vpn_network_addr: String,
 
@@ -165,6 +166,14 @@ pub struct CliOptions {
     default_value = "vpn0"
     )]
     pub vpn_interface_name: String,
+
+    #[structopt(
+    long = "vpn-layer",
+    help = "Name of the vpn interface",
+    default_value = "tun",
+    possible_values = &["tun", "tap"]
+    )]
+    pub vpn_layer: String,
 }
 
 #[actix_rt::main]
@@ -189,7 +198,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = opt.vpn_network_addr.parse::<IpAddr>()?;
     let mask = opt.vpn_network_mask.parse::<IpAddr>()?;
     let mut config = tun::Configuration::default();
+    let vpn_layer = match opt.vpn_layer.as_str() {
+        "tun" => tun::Layer::L3,
+        "tap" => tun::Layer::L2,
+        _ => panic!("Invalid vpn layer"),
+    };
     config
+        .layer(vpn_layer)
         .address(addr)
         .netmask(mask)
         .name(opt.vpn_interface_name)
@@ -197,7 +212,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dev = tun::create_as_async(&config).unwrap();
 
-    let (tun_sink, tun_stream) = dev.into_framed().split();
+
+    let (tun_sink, tun_stream) = tokio_util::codec::Framed::new(dev, TapPacketCodec::new()).split();
     let _ws_actor = VpnWebSocket::start(ws_sink, ws_stream, tun_sink, tun_stream);
 
     actix_rt::signal::ctrl_c().await?;

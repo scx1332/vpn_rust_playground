@@ -17,7 +17,6 @@ use std::io;
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-
 /// A Tun Packet to be sent or received on the TUN interface.
 #[derive(Debug)]
 pub struct TapPacket(Bytes);
@@ -50,6 +49,12 @@ impl TapPacketCodec {
     }
 }
 
+impl Default for TapPacketCodec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Decoder for TapPacketCodec {
     type Item = TapPacket;
     type Error = io::Error;
@@ -69,7 +74,7 @@ impl Decoder for TapPacketCodec {
             let _ = pkt.split_to(4);
         }*/
 
-      //  let proto = infer_proto(pkt.as_ref());
+        //  let proto = infer_proto(pkt.as_ref());
         Ok(Some(TapPacket(pkt.freeze())))
     }
 }
